@@ -1,0 +1,31 @@
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Sid": "Statement1",
+            "Effect": "Allow",
+            "Action": [
+                "ecs:CreateCluster",
+                "ecs:DeleteCluster",
+                "ecs:DescribeClusters",
+                "ecs:RegisterTaskDefinition",
+                "ecs:DeregisterTaskDefinition",
+                "ecs:DescribeTaskDefinition",
+                "ecs:CreateService",
+                "ecs:UpdateService",
+                "ecs:DescribeServices",
+                "ecs:DeleteService",
+                "ecs:ListServices",
+                "ecs:ListTasks",
+                "ecs:DescribeTasks",
+                "ecs:StopTask"
+            ],
+            "Resource": "*",
+            "Condition": {
+                "StringEquals": {
+                    "aws:RequestedRegion": "ap-south-1"
+                }
+            }
+        }
+    ]
+}

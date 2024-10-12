@@ -1,0 +1,24 @@
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Sid": "Statement1",
+            "Effect": "Allow",
+            "Action": [
+                "application-autoscaling:RegisterScalableTarget",
+                "application-autoscaling:DescribeScalableTargets",
+                "application-autoscaling:ListTagsForResource",
+                "application-autoscaling:DeregisterScalableTarget",
+                "application-autoscaling:PutScalingPolicy",
+                "application-autoscaling:DescribeScalingPolicies",
+                "application-autoscaling:DeleteScalingPolicy"
+            ],
+            "Resource": "*",
+            "Condition": {
+                "StringEquals": {
+                    "aws:RequestedRegion": "ap-south-1"
+                }
+            }
+        }
+    ]
+}
