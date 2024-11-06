@@ -23,7 +23,8 @@
                 "elasticloadbalancing:DescribeLoadBalancerAttributes",
                 "elasticloadbalancing:DescribeTargetGroupAttributes",
                 "elasticloadbalancing:DescribeTags",
-                "elasticloadbalancing:ModifyTargetGroup"
+                "elasticloadbalancing:ModifyTargetGroup",
+                "elasticloadbalancing:DescribeListenerAttributes"
             ],
             "Resource": "*",
             "Condition": {
