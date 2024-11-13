@@ -1,0 +1,140 @@
+name: Deploy to EC2 from ECR
+
+on:
+  push:
+    branches:
+      - "-"
+
+env:
+  BRANCH: ${{ github.ref_name }}
+  ECR_REPOSITORY_URL: ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/${{ secrets.ECR_MASTER_AU_REPOSITORY }}:${{ github.sha }}
+  EC2_HOST: ${{ secrets.EC2_MASTER_AU_HOST }}
+  EC2_USER: ${{ secrets.EC2_MASTER_AU_USER }}
+  EC2_KEY: ${{ secrets.EC2_MASTER_AU_KEY }}
+  SECRET_ID: ${{ secrets.STAGING_SECRET_ID }}
+
+jobs:
+  build-and-push:
+    name: Build Docker Image and Push to ECR
+    runs-on: ubuntu-latest
+
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Configure AWS credentials from OIDC
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-region: ${{ secrets.AWS_REGION }}
+          role-to-assume: "arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/github-action-deployment-role"
+          role-session-name: "GitHubActionsSession"
+
+      - name: Setup Docker Buildx
+        uses: docker/setup-buildx-action@v1
+
+      - name: Set branch name as Docker ARG
+        run: echo "BRANCH=${{ env.BRANCH }}" >> $GITHUB_ENV
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v1
+
+      - name: Fetch Secrets from AWS Secrets Manager and create .env file
+        run: |
+          # Fetch secret from AWS Secrets Manager
+          SECRET_JSON=$(aws secretsmanager get-secret-value --secret-id ${{ env.SECRET_ID }} --query 'SecretString' --output text)
+
+          # Parse the secret and create .env file
+          echo "$SECRET_JSON" | jq -r 'to_entries | .[] | "\(.key)=\(.value)"' > .env
+
+      - name: Build Docker image
+        run: |
+          docker build -t ${{ env.ECR_REPOSITORY_URL }} --build-arg BRANCH=${{ env.BRANCH }} -f Dockerfile .
+
+      - name: Push Docker image to Amazon ECR
+        run: |
+          docker push ${{ env.ECR_REPOSITORY_URL }}
+
+  deploy:
+    name: Deploy to EC2 with Zero Downtime
+    runs-on: ubuntu-latest
+    needs: build-and-push
+
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Configure AWS credentials from OIDC
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-region: ${{ secrets.AWS_REGION }}
+          role-to-assume: "arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/github-action-deployment-role"
+          role-session-name: "GitHubActionsSession"
+
+      - name: Set up SSH
+        uses: webfactory/ssh-agent@v0.5.3
+        with:
+          ssh-private-key: ${{ env.EC2_KEY }}
+
+      - name: Deploy on EC2
+        run: |
+          ssh -o StrictHostKeyChecking=no ${{ env.EC2_USER }}@${{ env.EC2_HOST }} << 'EOF'
+            # Set container name dynamically based on branch name and random port
+            BASE_CONTAINER_NAME="${{ env.BRANCH }}"
+            RANDOM_PORT=$(($RANDOM % 2001 + 3000))  # Generate port between 3000 and 5000
+            CONTAINER_NAME="${BASE_CONTAINER_NAME}_${RANDOM_PORT}"
+
+            # Log into ECR
+            aws ecr get-login-password --region ${{ secrets.AWS_REGION }} | docker login --username AWS --password-stdin ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com
+
+            # Clean up unused Docker resources
+            docker system prune -a -f --volumes
+
+            # Pull the latest image from ECR
+            docker pull ${{ env.ECR_REPOSITORY_URL }}
+
+            # Run the new container with the random port
+            docker run -d --name $CONTAINER_NAME -p $RANDOM_PORT:3000 ${{ env.ECR_REPOSITORY_URL }}
+
+            # Update Nginx configuration to use the new container's port
+              sudo sed -i "s|proxy_pass http://localhost:[0-9]\+;|proxy_pass http://localhost:$RANDOM_PORT;|g" /etc/nginx/sites-available/default
+              sudo systemctl reload nginx   # Reload Nginx to apply the new configuration
+
+            # Ensure the new container is running
+            if docker ps -q -f name=$CONTAINER_NAME; then
+              echo "New container is running, checking old containers' uptimes..."
+
+              # Get all container IDs with the same base name (ignoring the port part)
+              OLD_CONTAINERS=$(docker ps -a -f "name=${BASE_CONTAINER_NAME}" --format '{{.ID}}')
+
+              # Get the uptime of the new container (in Unix timestamp format)
+              NEW_UPTIME=$(docker inspect --format '{{.State.StartedAt}}' $CONTAINER_NAME)
+              NEW_TIMESTAMP=$(date -d "$NEW_UPTIME" +%s)  # Convert to Unix timestamp
+
+              # Iterate through each old container and compare its uptime with the new one
+              for OLD_CONTAINER in $OLD_CONTAINERS; do
+                OLD_UPTIME=$(docker inspect --format '{{.State.StartedAt}}' $OLD_CONTAINER)
+                OLD_TIMESTAMP=$(date -d "$OLD_UPTIME" +%s)  # Convert to Unix timestamp
+
+                # Compare uptimes and stop/remove the old container if it has been running longer than the new one
+                if [ "$OLD_TIMESTAMP" -lt "$NEW_TIMESTAMP" ]; then
+                  echo "The old container has been running longer. Stopping and removing the old container..."
+
+                  # Stop and remove the old container
+                  docker stop $OLD_CONTAINER || true
+                  docker rm $OLD_CONTAINER || true
+                fi
+              done
+
+              # Remove the old unused images
+              docker image prune -a -f
+            else
+              echo "New container failed to start, aborting the deployment."
+              exit 1
+            fi
+          EOF
