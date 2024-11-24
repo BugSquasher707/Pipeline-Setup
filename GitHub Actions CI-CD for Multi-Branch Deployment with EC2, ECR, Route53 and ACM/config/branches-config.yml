@@ -1,0 +1,6 @@
+feature-refactor-cicd-pipeline:
+  USE_ROOT_DOMAIN: "true"
+  ENVIRONMENT: "development"
+  ECR_REPOSITORY: "481336486259.dkr.ecr.ap-southeast-2.amazonaws.com/drivemate/frontend-dev"
+  ENVIRONMENT_SECRET_ID: "drivelah-au/web/staging/um2e2niYVwiBn5WbAu"
+  DEPLOYMENT_SECRET_ID: "drivemate-frontend/dev/github-secrets"

@@ -1,0 +1,718 @@
+name: GitHub Actions CI-CD for Multi-Branch Deployment with EC2, ECR, Secret Manager, Route53 and ACM
+
+on:
+  push:
+    branches:
+      - '-'
+
+env:
+  AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
+  AWS_REGION: ${{ secrets.AWS_REGION }}
+  CONFIG_FILE: "config/branches-config.yml"
+  BRANCH: $(echo "${{ github.ref }}" | sed 's|refs/heads/||' | tr -c '[:alnum:]-' '-' | tr '[:upper:]' '[:lower:]' | sed 's/-\{2,\}/-/g' | sed 's/^-//' | sed 's/-$//')
+
+jobs:  
+  build-and-push:
+    name: Build Docker Image and Push to ECR
+    runs-on: ubuntu-latest
+
+    permissions:
+      id-token: write  
+      contents: read   
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Configure AWS credentials from OIDC
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: "arn:aws:iam::${{ env.AWS_ACCOUNT_ID }}:role/github-action-deployment-role"
+          role-session-name: "GitHubActionsSession"
+      
+      - name: Install yq (for parsing YAML)
+        run: |
+          sudo wget https://github.com/mikefarah/yq/releases/download/v4.16.1/yq_linux_amd64 -O /usr/local/bin/yq
+          sudo chmod +x /usr/local/bin/yq
+
+      - name: Parse branches-config.yml
+        run: |
+          BRANCH=${{ env.BRANCH }}
+          CONFIG_FILE=${{ env.CONFIG_FILE }}
+
+          # Ensure the configuration file exists
+          if [ ! -f "$CONFIG_FILE" ]; then
+            echo "Configuration file not found: $CONFIG_FILE"
+            exit 1
+          fi
+
+          # List all branch names in the config file
+          BRANCHES=$(yq e 'keys | .[]' $CONFIG_FILE)
+          echo "Available branches in config: $BRANCHES"
+
+          # Check for exact match
+          if echo "$BRANCHES" | grep -qx "$BRANCH"; then
+            echo "Branch $BRANCH found in configuration."
+
+            # Extract values for the matching branch
+            ENVIRONMENT=$(yq e ".$BRANCH.ENVIRONMENT" $CONFIG_FILE)
+            ECR_REPOSITORY=$(yq e ".$BRANCH.ECR_REPOSITORY" $CONFIG_FILE)
+            ENVIRONMENT_SECRET_ID=$(yq e ".$BRANCH.ENVIRONMENT_SECRET_ID" $CONFIG_FILE)
+            DEPLOYMENT_SECRET_ID=$(yq e ".$BRANCH.DEPLOYMENT_SECRET_ID" $CONFIG_FILE)
+
+            # Ensure values are set and not null
+            if [ "$ENVIRONMENT" == "null" ] || [ "$ECR_REPOSITORY" == "null" ] || [ "$ENVIRONMENT_SECRET_ID" == "null" ] || [ "$DEPLOYMENT_SECRET_ID" == "null" ]; then
+              echo "One or more required configuration values are missing."
+              exit 1
+            fi
+
+            echo "ENVIRONMENT=$ENVIRONMENT" >> $GITHUB_ENV
+            echo "ECR_REPOSITORY=$ECR_REPOSITORY" >> $GITHUB_ENV
+            echo "ENVIRONMENT_SECRET_ID=$ENVIRONMENT_SECRET_ID" >> $GITHUB_ENV
+            echo "DEPLOYMENT_SECRET_ID=$DEPLOYMENT_SECRET_ID" >> $GITHUB_ENV
+
+            # Add masking for sensitive information
+            echo "::add-mask::$ECR_REPOSITORY"
+            echo "::add-mask::$ENVIRONMENT_SECRET_ID"
+            echo "::add-mask::$DEPLOYMENT_SECRET_ID"
+          else
+            echo "Branch $BRANCH is not in the configuration. Exiting..."
+            exit 1
+          fi
+
+      - name: Setup Docker Buildx
+        uses: docker/setup-buildx-action@v1
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v1
+
+      - name: Fetch Environment Secrets from AWS Secrets Manager and create .env file
+        run: |
+          ENVIRONMENT_SECRET_JSON=$(aws secretsmanager get-secret-value --secret-id $ENVIRONMENT_SECRET_ID --query 'SecretString' --output text)
+          echo "$ENVIRONMENT_SECRET_JSON" | jq -r 'to_entries | .[] | "\(.key)=\(.value)"' > .env
+          
+      - name: Build and Push Docker Image
+        run: |
+          docker build -t $ECR_REPOSITORY --build-arg BRANCH=${{ env.BRANCH }} -f Dockerfile .
+          docker push $ECR_REPOSITORY
+
+  deploy:
+    name: Deploy to EC2
+    runs-on: ubuntu-latest
+    needs: build-and-push
+
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Configure AWS credentials from OIDC
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: "arn:aws:iam::${{ env.AWS_ACCOUNT_ID }}:role/github-action-deployment-role"
+          role-session-name: "GitHubActionsSession"
+
+      - name: Install yq (for parsing YAML)
+        run: |
+          sudo wget https://github.com/mikefarah/yq/releases/download/v4.16.1/yq_linux_amd64 -O /usr/local/bin/yq
+          sudo chmod +x /usr/local/bin/yq
+
+      - name: Parse branches-config.yml
+        run: |
+          BRANCH=${{ env.BRANCH }}
+          CONFIG_FILE=${{ env.CONFIG_FILE }}
+      
+          # Ensure the configuration file exists
+          if [ ! -f "$CONFIG_FILE" ]; then
+            echo "Configuration file not found: $CONFIG_FILE"
+            exit 1
+          fi
+      
+          # List all branch names in the config file
+          BRANCHES=$(yq e 'keys | .[]' "$CONFIG_FILE")
+          echo "Available branches in config: $BRANCHES"
+      
+          # Check for exact match
+          if echo "$BRANCHES" | grep -qx "$BRANCH"; then
+            echo "Branch $BRANCH found in configuration."
+      
+            # Extract values for the matching branch
+            USE_ROOT_DOMAIN=$(yq e ".$BRANCH.USE_ROOT_DOMAIN" "$CONFIG_FILE")
+            ENVIRONMENT=$(yq e ".$BRANCH.ENVIRONMENT" "$CONFIG_FILE")
+            ECR_REPOSITORY=$(yq e ".$BRANCH.ECR_REPOSITORY" "$CONFIG_FILE")
+            DEPLOYMENT_SECRET_ID=$(yq e ".$BRANCH.DEPLOYMENT_SECRET_ID" "$CONFIG_FILE")
+      
+            # Ensure values are set and not null
+            if [ "$ENVIRONMENT" == "null" ] || [ "$ECR_REPOSITORY" == "null" ] || [ "$DEPLOYMENT_SECRET_ID" == "null" ]; then
+              echo "One or more required configuration values are missing."
+              exit 1
+            fi
+
+            echo "USE_ROOT_DOMAIN=$USE_ROOT_DOMAIN" >> $GITHUB_ENV
+            echo "ENVIRONMENT=$ENVIRONMENT" >> $GITHUB_ENV
+            echo "ECR_REPOSITORY=$ECR_REPOSITORY" >> $GITHUB_ENV
+            echo "DEPLOYMENT_SECRET_ID=$DEPLOYMENT_SECRET_ID" >> $GITHUB_ENV
+      
+            # Mask sensitive values to avoid exposing them in logs
+            echo "::add-mask::$ECR_REPOSITORY"
+            echo "::add-mask::$DEPLOYMENT_SECRET_ID"
+          else
+            echo "Branch $BRANCH is not in the configuration. Exiting..."
+            exit 1
+          fi
+
+      - name: Fetch Deployment Secrets from AWS Secrets Manager
+        run: |
+          DEPLOYMENT_SECRET_JSON=$(aws secretsmanager get-secret-value --secret-id $DEPLOYMENT_SECRET_ID --query 'SecretString' --output text)
+          
+          # Extract the required values from the JSON
+          EC2_USER=$(echo "$DEPLOYMENT_SECRET_JSON" | jq -r '.EC2_USER')
+          EC2_HOST=$(echo "$DEPLOYMENT_SECRET_JSON" | jq -r '.EC2_HOST')
+          SECURITY_GROUP_ID=$(echo "$DEPLOYMENT_SECRET_JSON" | jq -r '.EC2_SECURITY_GROUP_ID')
+          ROUTE53_ZONE_ID=$(echo "$DEPLOYMENT_SECRET_JSON" | jq -r '.ROUTE53_ZONE_ID')
+          BASE_DOMAIN=$(echo "$DEPLOYMENT_SECRET_JSON" | jq -r '.BASE_DOMAIN')
+          LOAD_BALANCER_DOMAIN=$(echo "$DEPLOYMENT_SECRET_JSON" | jq -r '.LOAD_BALANCER_DOMAIN')
+          SSL_CERTIFICATE_ARN=$(echo "$DEPLOYMENT_SECRET_JSON" | jq -r '.SSL_CERTIFICATE_ARN')
+          LOAD_BALANCER_ARN=$(echo "$DEPLOYMENT_SECRET_JSON" | jq -r '.LOAD_BALANCER_ARN')
+          TARGET_GROUP_ARN=$(echo "$DEPLOYMENT_SECRET_JSON" | jq -r '.TARGET_GROUP_ARN')
+
+          # Set the extracted values as environment variables
+          echo "EC2_USER=$EC2_USER" >> $GITHUB_ENV
+          echo "EC2_HOST=$EC2_HOST" >> $GITHUB_ENV
+          echo "SECURITY_GROUP_ID=$SECURITY_GROUP_ID" >> $GITHUB_ENV
+          echo "ROUTE53_ZONE_ID=$ROUTE53_ZONE_ID" >> $GITHUB_ENV
+          echo "BASE_DOMAIN=$BASE_DOMAIN" >> $GITHUB_ENV
+          echo "LOAD_BALANCER_DOMAIN=$LOAD_BALANCER_DOMAIN" >> $GITHUB_ENV
+          echo "SSL_CERTIFICATE_ARN=$SSL_CERTIFICATE_ARN" >> $GITHUB_ENV
+          echo "LOAD_BALANCER_ARN=$LOAD_BALANCER_ARN" >> $GITHUB_ENV
+          echo "TARGET_GROUP_ARN=$TARGET_GROUP_ARN" >> $GITHUB_ENV
+
+          # Add masking for sensitive information
+          echo "::add-mask::$EC2_USER"
+          echo "::add-mask::$EC2_HOST"
+          echo "::add-mask::$SECURITY_GROUP_ID"
+          echo "::add-mask::$ROUTE53_ZONE_ID"
+          echo "::add-mask::$BASE_DOMAIN"
+          echo "::add-mask::$LOAD_BALANCER_DOMAIN"
+          echo "::add-mask::$SSL_CERTIFICATE_ARN"
+          echo "::add-mask::$LOAD_BALANCER_ARN"
+          echo "::add-mask::$TARGET_GROUP_ARN"
+
+          # Decode the private key from the JSON
+          echo "$(echo "$DEPLOYMENT_SECRET_JSON" | jq -r '.ENCODED_EC2_KEY' | base64 -d)" > private_key.pem
+          chmod 600 private_key.pem
+
+          echo "Deployment Secrets fetched successfully."
+
+      - name: Deploy to EC2
+        run: |
+          ssh -i private_key.pem -o StrictHostKeyChecking=no $EC2_USER@$EC2_HOST << 'EOF'
+            set -e
+            BRANCH="${{ env.BRANCH }}"
+            AWS_ACCOUNT_ID=${{ env.AWS_ACCOUNT_ID }}
+            AWS_REGION=${{ env.AWS_REGION }}
+            EC2_USER="${{ env.EC2_USER }}"
+            EC2_HOST="${{ env.EC2_HOST }}"
+            PORT_FILE="/home/$EC2_USER/deployment-info.txt"
+            JSON_FILE="/var/www/html/deployment-info.json"
+            NGINX_AVAILABLE="/etc/nginx/sites-available/$BRANCH"
+            NGINX_ENABLED="/etc/nginx/sites-enabled/$BRANCH"
+            ECR_REPOSITORY="${{ env.ECR_REPOSITORY }}"
+            SECURITY_GROUP_ID=${{ env.SECURITY_GROUP_ID }}
+            ROUTE53_ZONE_ID="${{ env.ROUTE53_ZONE_ID }}"
+            BASE_DOMAIN="${{ env.BASE_DOMAIN }}"
+            SUBDOMAIN="${BRANCH}.${BASE_DOMAIN}"
+            DOMAIN="https://${SUBDOMAIN}"
+            LOAD_BALANCER_DOMAIN="${{ env.LOAD_BALANCER_DOMAIN }}"
+            SSL_CERTIFICATE_ARN="${{ env.SSL_CERTIFICATE_ARN }}"
+            LOAD_BALANCER_ARN="${{ env.LOAD_BALANCER_ARN }}"
+            TARGET_GROUP_ARN="${{ env.TARGET_GROUP_ARN }}"
+            USE_ROOT_DOMAIN="${{ env.USE_ROOT_DOMAIN }}"
+
+            # Ensure the ports file exists
+            if [ ! -f "$PORT_FILE" ]; then
+              touch "$PORT_FILE"
+              sudo chmod 666 "$PORT_FILE"
+              echo "Created $PORT_FILE"
+            fi
+
+            # If the branch has the root domain enabled, use the base domain for the subdomain
+            if [ "$USE_ROOT_DOMAIN" == "true" ]; then
+              SUBDOMAIN="${BASE_DOMAIN}"
+              DOMAIN="https://${BASE_DOMAIN}"
+              NGINX_AVAILABLE="/etc/nginx/sites-available/$BASE_DOMAIN"
+              NGINX_ENABLED="/etc/nginx/sites-enabled/$BASE_DOMAIN"
+            fi
+
+            # Generate a random port and ensure it's not in use by the system or Docker
+            get_random_port() {
+              while true; do
+                local port=$((RANDOM % 2001 + 3000))
+                if ! ss -tuln | grep -q ":$port" && ! docker ps --format '{{.Ports}}' | grep -q ":$port->"; then
+                  echo $port
+                  return
+                fi
+              done
+            }
+
+            PORT=$(get_random_port)
+            CONTAINER_NAME="${BRANCH}_${PORT}"
+
+            # Docker login
+            aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com
+
+            # Clean up unused Docker resources
+            docker system prune -a -f --volumes
+
+            # Pull the latest image from ECR
+            docker pull $ECR_REPOSITORY || { echo "Failed to pull image from ECR"; exit 1; }
+
+            # Run the new container with the random port
+            if ! docker run -d --name $CONTAINER_NAME -p $PORT:3000 $ECR_REPOSITORY; then
+              echo "Failed to run Docker container due to port conflict. Retrying with a new port..."
+              PORT=$(get_random_port)
+              docker run -d --name $CONTAINER_NAME -p $PORT:3000 $ECR_REPOSITORY
+            fi
+
+            # Remove old port and configuration if it exists
+            if grep -q "^$BRANCH" "$PORT_FILE"; then
+              OLD_PORT=$(grep "^$BRANCH" "$PORT_FILE" | cut -d'|' -f2)
+              
+              echo "Removing old port $OLD_PORT for branch $BRANCH..."
+
+              # Remove old port from the port file
+              sed -i "/$BRANCH/d" "$PORT_FILE"
+
+              # Remove old Nginx configuration
+              sudo rm -f "$NGINX_SITES_AVAILABLE" "$NGINX_SITES_ENABLED"
+
+              # Remove old security group ingress rule
+              aws ec2 revoke-security-group-ingress --region $AWS_REGION --group-id $SECURITY_GROUP_ID --protocol tcp --port $OLD_PORT --cidr 0.0.0.0/0 || true
+
+              echo "Retrieving listener ARN for port $OLD_PORT..."
+              LISTENER_ARN=$(aws elbv2 describe-listeners \
+                  --region $AWS_REGION \
+                  --load-balancer-arn $LOAD_BALANCER_ARN \
+                  --query "Listeners[?Port==\`$OLD_PORT\`].ListenerArn" \
+                  --output text)
+
+              if [ -n "$LISTENER_ARN" ]; then
+                echo "Removing old listener rule for port $OLD_PORT..."
+                aws elbv2 delete-listener --region $AWS_REGION --listener-arn $LISTENER_ARN || { echo "Failed to delete listener rule for port $OLD_PORT"; }
+              else
+                echo "No listener rule found for port $OLD_PORT"
+              fi
+
+              if [ "$USE_ROOT_DOMAIN" == "true" ]; then
+                # Remove old Route 53 subdomain with Branch name
+                OLD_SUBDOMAIN="${BRANCH}.${BASE_DOMAIN}"
+                
+                # Check if the Route 53 record already exists
+                EXISTING_RECORD=$(aws route53 list-resource-record-sets \
+                --hosted-zone-id "$ROUTE53_ZONE_ID" \
+                --query "ResourceRecordSets[?Name == '${OLD_SUBDOMAIN}.' && Type == 'CNAME']" \
+                --output json)
+
+                if [ "$EXISTING_RECORD" != "[]" ]; then
+                  echo "Record $OLD_SUBDOMAIN of type CNAME exists. Removing..."
+                  aws route53 change-resource-record-sets \
+                    --hosted-zone-id "$ROUTE53_ZONE_ID" \
+                    --change-batch '{
+                      "Changes": [{
+                        "Action": "DELETE",
+                        "ResourceRecordSet": {
+                          "Name": "'"${OLD_SUBDOMAIN}."'",
+                          "Type": "CNAME",
+                          "TTL": 300,
+                          "ResourceRecords": [{"Value": "'"$LOAD_BALANCER_DOMAIN"'"}]
+                        }
+                      }]
+                    }' || { echo "Failed to remove subdomain $OLD_SUBDOMAIN from Route 53"; }
+                else
+                  echo "Record $OLD_SUBDOMAIN of type CNAME does not exist. Skipping removal."
+                fi
+              fi
+            fi
+
+            # Add the new branch details
+            echo "$BRANCH|$PORT|$EC2_HOST|$DOMAIN" >> "$PORT_FILE"
+
+            # Convert the port file to JSON
+            sudo jq -Rn \
+            '[inputs | split("|") | select(length == 4) | {
+              branch: .[0],
+              port: .[1],
+              host: .[2],
+              domain: .[3]
+            }] | { deployments: . }' < "$PORT_FILE" | sudo tee "$JSON_FILE" > /dev/null
+
+            sudo chmod 644 "$JSON_FILE"
+
+            # Create SSL Nginx configuration in sites-available
+            echo "server {
+              listen 80;
+              listen [::]:80;
+
+              server_name $SUBDOMAIN;
+
+              location / {
+                proxy_pass http://localhost:$PORT;
+                proxy_http_version 1.1;
+                proxy_set_header Upgrade \$http_upgrade;
+                proxy_set_header Connection 'upgrade';
+                proxy_set_header Host \$host;
+                proxy_cache_bypass \$http_upgrade;
+              }
+            }" | sudo tee "$NGINX_AVAILABLE" > /dev/null
+
+            # Create symbolic link in sites-enabled
+            if [ ! -L "$NGINX_ENABLED" ]; then
+              sudo ln -s "$NGINX_AVAILABLE" "$NGINX_ENABLED"
+            fi
+
+            # Reload Nginx
+            if systemctl is-active --quiet nginx; then
+              sudo systemctl reload nginx || { echo "Failed to reload Nginx"; exit 1; }
+            else
+              sudo nginx -s reload || { echo "Failed to reload Nginx"; exit 1; }
+            fi
+
+            # Check if the Route 53 record already exists
+            EXISTING_RECORD=$(aws route53 list-resource-record-sets \
+            --hosted-zone-id "$ROUTE53_ZONE_ID" \
+            --query "ResourceRecordSets[?Name == '${SUBDOMAIN}.' && Type == 'CNAME']" \
+            --output json)
+
+            if [ "$EXISTING_RECORD" == "[]" ]; then
+              # Add Route 53 subdomain
+              aws route53 change-resource-record-sets \
+                --hosted-zone-id "$ROUTE53_ZONE_ID" \
+                --change-batch '{
+                  "Changes": [{
+                    "Action": "UPSERT",
+                    "ResourceRecordSet": {
+                      "Name": "'"${SUBDOMAIN}."'",
+                      "Type": "CNAME",
+                      "TTL": 300,
+                      "ResourceRecords": [{"Value": "'"$LOAD_BALANCER_DOMAIN"'"}]
+                    }
+                  }]
+                }' || { echo "Failed to add subdomain $SUBDOMAIN to Route 53"; exit 1; }
+            else
+              echo "Record $SUBDOMAIN of type CNAME exists. Not need to Add."
+            fi
+
+            # Update security group
+            aws ec2 authorize-security-group-ingress --region $AWS_REGION --group-id $SECURITY_GROUP_ID --protocol tcp --port $PORT --cidr 0.0.0.0/0
+
+            # Create a new listener for the load balancer
+            aws elbv2 create-listener \
+              --region $AWS_REGION \
+              --load-balancer-arn $LOAD_BALANCER_ARN \
+              --protocol HTTPS \
+              --port $PORT \
+              --certificates CertificateArn=$SSL_CERTIFICATE_ARN \
+              --default-actions Type=forward,TargetGroupArn=$TARGET_GROUP_ARN || { echo "Failed to create listener rule for port $PORT"; exit 1; }
+
+            # Ensure the new container is running
+            if docker ps -q -f name=$CONTAINER_NAME; then
+              echo "New container is running, checking old containers' uptimes..."
+
+              # Get all container IDs with the same base name (ignoring the port part)
+              OLD_CONTAINERS=$(docker ps -a -f "name=${BRANCH}" --format '{{.ID}}')
+
+              # Get the uptime of the new container (in Unix timestamp format)
+              NEW_UPTIME=$(docker inspect --format '{{.State.StartedAt}}' $CONTAINER_NAME)
+              NEW_TIMESTAMP=$(date -d "$NEW_UPTIME" +%s)  # Convert to Unix timestamp
+
+              # Iterate through each old container and compare its uptime with the new one
+              for OLD_CONTAINER in $OLD_CONTAINERS; do
+                OLD_UPTIME=$(docker inspect --format '{{.State.StartedAt}}' $OLD_CONTAINER)
+                OLD_TIMESTAMP=$(date -d "$OLD_UPTIME" +%s)  # Convert to Unix timestamp
+
+                # Compare uptimes and stop/remove the old container if it has been running longer than the new one
+                if [ "$OLD_TIMESTAMP" -lt "$NEW_TIMESTAMP" ]; then
+                  echo "The old container has been running longer. Stopping and removing the old container..."
+
+                  # Stop and remove the old container
+                  docker stop $OLD_CONTAINER || true
+                  docker rm $OLD_CONTAINER || true
+                fi
+              done
+
+              # Remove the old unused images
+              docker image prune -a -f
+            else
+              echo "New container failed to start, aborting the deployment."
+              exit 1
+            fi
+
+            echo "Successfully deployed $BRANCH at $DOMAIN"
+          EOF
+
+  cleanup:
+    name: Cleanup Resources
+    runs-on: ubuntu-latest
+    needs: deploy
+
+    permissions:
+      id-token: write  
+      contents: read   
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Configure AWS credentials from OIDC
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: "arn:aws:iam::${{ env.AWS_ACCOUNT_ID }}:role/github-action-deployment-role"
+          role-session-name: "GitHubActionsSession"
+
+      - name: Install yq (for parsing YAML)
+        run: |
+          sudo wget https://github.com/mikefarah/yq/releases/download/v4.16.1/yq_linux_amd64 -O /usr/local/bin/yq
+          sudo chmod +x /usr/local/bin/yq
+
+      - name: Parse branches-config.yml
+        run: |
+          BRANCH=${{ env.BRANCH }}
+          CONFIG_FILE=${{ env.CONFIG_FILE }}
+
+          # Ensure the configuration file exists
+          if [ ! -f "$CONFIG_FILE" ]; then
+            echo "Configuration file not found: $CONFIG_FILE"
+            exit 1
+          fi
+
+          # List all branch names in the config file
+          BRANCHES=$(yq e 'keys | .[]' $CONFIG_FILE)
+          echo "Available branches in config: $BRANCHES"
+
+          # Check for exact match
+          if echo "$BRANCHES" | grep -qx "$BRANCH"; then
+            echo "Branch $BRANCH found in configuration."
+
+            # Extract values for the matching branch
+            ENVIRONMENT=$(yq e ".$BRANCH.ENVIRONMENT" $CONFIG_FILE)
+            DEPLOYMENT_SECRET_ID=$(yq e ".$BRANCH.DEPLOYMENT_SECRET_ID" $CONFIG_FILE)
+
+            # Ensure values are set and not null
+            if [ "$ENVIRONMENT" == "null" ] || [ "$DEPLOYMENT_SECRET_ID" == "null" ]; then
+              echo "DEPLOYMENT_SECRET_ID is missing."
+              exit 1
+            fi
+
+            echo "ENVIRONMENT=$ENVIRONMENT" >> $GITHUB_ENV
+            echo "DEPLOYMENT_SECRET_ID=$DEPLOYMENT_SECRET_ID" >> $GITHUB_ENV
+
+            # Add masking for sensitive information
+            echo "::add-mask::$DEPLOYMENT_SECRET_ID"
+          else
+            echo "Branch $BRANCH is not in the configuration. Exiting..."
+            exit 1
+          fi
+
+      - name: Fetch Deployment Secrets from AWS Secrets Manager
+        run: |
+          DEPLOYMENT_SECRET_JSON=$(aws secretsmanager get-secret-value --secret-id $DEPLOYMENT_SECRET_ID --query 'SecretString' --output text)
+    
+          # Extract the required values from the JSON
+          EC2_USER=$(echo "$DEPLOYMENT_SECRET_JSON" | jq -r '.EC2_USER')
+          EC2_HOST=$(echo "$DEPLOYMENT_SECRET_JSON" | jq -r '.EC2_HOST')
+          SECURITY_GROUP_ID=$(echo "$DEPLOYMENT_SECRET_JSON" | jq -r '.EC2_SECURITY_GROUP_ID')
+          ROUTE53_ZONE_ID=$(echo "$DEPLOYMENT_SECRET_JSON" | jq -r '.ROUTE53_ZONE_ID')
+          BASE_DOMAIN=$(echo "$DEPLOYMENT_SECRET_JSON" | jq -r '.BASE_DOMAIN')
+          LOAD_BALANCER_DOMAIN=$(echo "$DEPLOYMENT_SECRET_JSON" | jq -r '.LOAD_BALANCER_DOMAIN')
+          SSL_CERTIFICATE_ARN=$(echo "$DEPLOYMENT_SECRET_JSON" | jq -r '.SSL_CERTIFICATE_ARN')
+          LOAD_BALANCER_ARN=$(echo "$DEPLOYMENT_SECRET_JSON" | jq -r '.LOAD_BALANCER_ARN')
+          TARGET_GROUP_ARN=$(echo "$DEPLOYMENT_SECRET_JSON" | jq -r '.TARGET_GROUP_ARN')
+
+          # Set the extracted values as environment variables
+          echo "EC2_USER=$EC2_USER" >> $GITHUB_ENV
+          echo "EC2_HOST=$EC2_HOST" >> $GITHUB_ENV
+          echo "SECURITY_GROUP_ID=$SECURITY_GROUP_ID" >> $GITHUB_ENV
+          echo "ROUTE53_ZONE_ID=$ROUTE53_ZONE_ID" >> $GITHUB_ENV
+          echo "BASE_DOMAIN=$BASE_DOMAIN" >> $GITHUB_ENV
+          echo "LOAD_BALANCER_DOMAIN=$LOAD_BALANCER_DOMAIN" >> $GITHUB_ENV
+          echo "SSL_CERTIFICATE_ARN=$SSL_CERTIFICATE_ARN" >> $GITHUB_ENV
+          echo "LOAD_BALANCER_ARN=$LOAD_BALANCER_ARN" >> $GITHUB_ENV
+          echo "TARGET_GROUP_ARN=$TARGET_GROUP_ARN" >> $GITHUB_ENV
+
+          # Add masking for sensitive information
+          echo "::add-mask::$EC2_USER"
+          echo "::add-mask::$EC2_HOST"
+          echo "::add-mask::$SECURITY_GROUP_ID"
+          echo "::add-mask::$ROUTE53_ZONE_ID"
+          echo "::add-mask::$BASE_DOMAIN"
+          echo "::add-mask::$LOAD_BALANCER_DOMAIN"
+          echo "::add-mask::$SSL_CERTIFICATE_ARN"
+          echo "::add-mask::$LOAD_BALANCER_ARN"
+          echo "::add-mask::$TARGET_GROUP_ARN"
+
+          # Decode the private key from the JSON
+          echo "$(echo "$DEPLOYMENT_SECRET_JSON" | jq -r '.ENCODED_EC2_KEY' | base64 -d)" > private_key.pem
+          chmod 600 private_key.pem
+
+          echo "Deployment Secrets fetched successfully."
+
+      - name: Cleanup Resources
+        run: |
+          CONFIG_FILE=${{ env.CONFIG_FILE }}
+
+          # Ensure the configuration file exists
+          if [ ! -f "$CONFIG_FILE" ]; then
+            echo "Configuration file not found: $CONFIG_FILE"
+            exit 1
+          fi
+          
+          ALLOWED_BRANCHES=$(yq e 'keys | .[]' "$CONFIG_FILE" | tr '\n' ' ')
+          echo "Allowed Branches: $ALLOWED_BRANCHES"
+          
+          # Pass the allowed branches as an environment variable
+          ssh -i private_key.pem -o StrictHostKeyChecking=no $EC2_USER@$EC2_HOST \
+          "ALLOWED_BRANCHES='$ALLOWED_BRANCHES' \
+          bash -s" << 'EOF'
+            set -e
+
+            EC2_USER="${{ env.EC2_USER }}"
+            PORT_FILE="/home/$EC2_USER/deployment-info.txt"
+            JSON_FILE="/var/www/html/deployment-info.json"
+            NGINX_AVAILABLE="/etc/nginx/sites-available"
+            NGINX_ENABLED="/etc/nginx/sites-enabled"
+            AWS_REGION=${{ env.AWS_REGION }}
+            SECURITY_GROUP_ID=${{ env.SECURITY_GROUP_ID }}
+            ROUTE53_ZONE_ID="${{ env.ROUTE53_ZONE_ID }}"
+            BASE_DOMAIN="${{ env.BASE_DOMAIN }}"
+            LOAD_BALANCER_DOMAIN="${{ env.LOAD_BALANCER_DOMAIN }}"
+            SSL_CERTIFICATE_ARN="${{ env.SSL_CERTIFICATE_ARN }}"
+            LOAD_BALANCER_ARN="${{ env.LOAD_BALANCER_ARN }}"
+            TARGET_GROUP_ARN="${{ env.TARGET_GROUP_ARN }}"
+
+            # Ensure the JSON file exists
+            if [ ! -f "$JSON_FILE" ]; then
+              echo "Deployment info file not found. Exiting cleanup."
+              exit 0
+            fi
+
+            # Parse the current deployments
+            DEPLOYED_BRANCHES=$(jq -r '.deployments[].branch' "$JSON_FILE")
+
+            # Loop through each deployed branch
+            echo "$DEPLOYED_BRANCHES" | while read -r DEPLOYED_BRANCH; do
+              if echo "$ALLOWED_BRANCHES" | tr ' ' '\n' | grep -qx "$DEPLOYED_BRANCH"; then
+                echo "Keeping branch $DEPLOYED_BRANCH"
+              else
+                echo "Cleaning up branch $DEPLOYED_BRANCH"
+
+                # Get associated port
+                DEPLOYED_PORT=$(jq -r ".deployments[] | select(.branch==\"$DEPLOYED_BRANCH\") | .port" "$JSON_FILE")
+                DEPLOYED_IMAGE=$(docker inspect "${DEPLOYED_BRANCH}_${DEPLOYED_PORT}" --format '{{.Config.Image}}' || echo "")
+                SUBDOMAIN="${DEPLOYED_BRANCH}.${BASE_DOMAIN}"
+                DOMAIN="https://${SUBDOMAIN}"
+
+                # Stop and remove Docker container
+                echo "Stopping and removing Docker container for branch $DEPLOYED_BRANCH"
+                docker stop "${DEPLOYED_BRANCH}_${DEPLOYED_PORT}" || true
+                docker rm "${DEPLOYED_BRANCH}_${DEPLOYED_PORT}" || true
+
+                # Remove Docker image if it exists
+                if [ -n "$DEPLOYED_IMAGE" ]; then
+                  echo "Removing Docker image: $DEPLOYED_IMAGE"
+                  docker rmi "$DEPLOYED_IMAGE" || echo "Failed to remove Docker image $DEPLOYED_IMAGE"
+                else
+                  echo "No associated Docker image found for branch $DEPLOYED_BRANCH"
+                fi
+
+                # Remove port from deployment-info.txt
+                echo "Removing branch $DEPLOYED_BRANCH from deployment-info.txt"
+                sudo sed -i "/$DEPLOYED_BRANCH/d" "$PORT_FILE"
+
+                # Convert the port file to JSON
+                sudo jq -Rn \
+                '[inputs | split("|") | select(length == 4) | {
+                  branch: .[0],
+                  port: .[1],
+                  host: .[2],
+                  domain: .[3]
+                }] | { deployments: . }' < "$PORT_FILE" | sudo tee "$JSON_FILE" > /dev/null
+
+                sudo chmod 644 "$JSON_FILE"
+
+                # Remove associated Nginx configuration
+                echo "Removing Nginx configuration for branch $DEPLOYED_BRANCH"
+                sudo rm -f "$NGINX_AVAILABLE/$DEPLOYED_BRANCH" "$NGINX_ENABLED/$DEPLOYED_BRANCH"
+
+                # Reload Nginx
+                if systemctl is-active --quiet nginx; then
+                  sudo systemctl reload nginx || { echo "Failed to reload Nginx"; exit 1; }
+                else
+                  sudo nginx -s reload || { echo "Failed to reload Nginx"; exit 1; }
+                fi
+
+                # Remove security group ingress rule
+                if [ -n "$DEPLOYED_PORT" ]; then
+                  echo "Removing security group rule for port $DEPLOYED_PORT"
+                  aws ec2 revoke-security-group-ingress --region "$AWS_REGION" --group-id "$SECURITY_GROUP_ID" --protocol tcp --port "$DEPLOYED_PORT" --cidr 0.0.0.0/0 || echo "Failed to remove security group rule for port $DEPLOYED_PORT"
+                else
+                  echo "Port for branch $DEPLOYED_BRANCH is empty or undefined. Skipping security group rule removal."
+                fi
+
+                # Remove listener rule for the target group
+                if [ -n "$DEPLOYED_PORT" ]; then
+                  echo "Retrieving listener ARN for port $DEPLOYED_PORT..."
+                  LISTENER_ARN=$(aws elbv2 describe-listeners \
+                      --region "$AWS_REGION" \
+                      --load-balancer-arn "$LOAD_BALANCER_ARN" \
+                      --query "Listeners[?Port==\`$DEPLOYED_PORT\`].ListenerArn" \
+                      --output text)
+
+                  if [ -n "$LISTENER_ARN" ]; then
+                    echo "Removing listener rule for port $DEPLOYED_PORT..."
+                    aws elbv2 delete-listener --region "$AWS_REGION" --listener-arn "$LISTENER_ARN" || echo "Failed to delete listener rule for port $DEPLOYED_PORT"
+                  else
+                    echo "No listener rule found for port $DEPLOYED_PORT"
+                  fi
+                else
+                  echo "Port for branch $DEPLOYED_BRANCH is empty or undefined. Skipping listener rule removal."
+                fi
+
+                # Remove Route 53 subdomain
+                echo "Removing Route 53 subdomain $SUBDOMAIN"
+
+                # Check if the Route 53 record already exists
+                EXISTING_RECORD=$(aws route53 list-resource-record-sets \
+                --hosted-zone-id "$ROUTE53_ZONE_ID" \
+                --query "ResourceRecordSets[?Name == '${SUBDOMAIN}.' && Type == 'CNAME']" \
+                --output json)
+
+                if [ "$EXISTING_RECORD" != "[]" ]; then
+                echo "Record $SUBDOMAIN of type CNAME exists. Removing..."
+                aws route53 change-resource-record-sets \
+                  --hosted-zone-id "$ROUTE53_ZONE_ID" \
+                  --change-batch '{
+                    "Changes": [{
+                      "Action": "DELETE",
+                      "ResourceRecordSet": {
+                        "Name": "'"${SUBDOMAIN}."'",
+                        "Type": "CNAME",
+                        "TTL": 300,
+                        "ResourceRecords": [{"Value": "'"$LOAD_BALANCER_DOMAIN"'"}]
+                      }
+                    }]
+                  }' || echo "Failed to remove subdomain $SUBDOMAIN from Route 53"
+                else
+                  echo "Record $SUBDOMAIN of type CNAME does not exist. Skipping removal."
+                fi
+              fi
+            done
+
+            echo "Cleanup completed."
+          EOF
