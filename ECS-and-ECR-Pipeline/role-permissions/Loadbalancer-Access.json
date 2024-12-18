@@ -24,7 +24,8 @@
                 "elasticloadbalancing:DescribeTargetGroupAttributes",
                 "elasticloadbalancing:DescribeTags",
                 "elasticloadbalancing:ModifyTargetGroup",
-                "elasticloadbalancing:DescribeListenerAttributes"
+                "elasticloadbalancing:DescribeListenerAttributes",
+                "ec2:DescribeAccountAttributes"
             ],
             "Resource": "*",
             "Condition": {
