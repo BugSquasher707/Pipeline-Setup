@@ -2,7 +2,14 @@ name: Docker Image CI/CD - Production
 
 on:
   push:
-    branches: ["-"]
+    branches: ['main']
+
+env:
+  ENVIRONMENT: production
+  AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
+  AWS_REGION: ${{ secrets.AWS_REGION }}
+  DEPLOYMENT_SECRETS: ${{ secrets.DEPLOYMENT_SECRETS_PRODUCTION }}
+  APP_SECRETS: ${{ secrets.APP_SECRETS_PRODUCTION }}
 
 jobs:
   build_and_deploy:
@@ -18,9 +25,39 @@ jobs:
       - name: Configure AWS credentials from OIDC
         uses: aws-actions/configure-aws-credentials@v2
         with:
-          aws-region: ${{ secrets.AWS_REGION }}
-          role-to-assume: "arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/github-action-ocid-role"
-          role-session-name: "GitHubActionsSession"
+          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: 'arn:aws:iam::${{ env.AWS_ACCOUNT_ID }}:role/github-action-ocid-role'
+          role-session-name: 'GitHubActionsSession'
+
+      - name: Fetch GitHub Secrets and create environment variables
+        run: |
+          DEPLOYMENT_SECRETS_JSON=$(aws secretsmanager get-secret-value --secret-id ${{ env.DEPLOYMENT_SECRETS }} --query 'SecretString' --output text)  
+
+          # Extract the required values from the JSON 
+          ECR_REPOSITORY=$(echo "$DEPLOYMENT_SECRETS_JSON" | jq -r '.ECR_REPOSITORY')
+          ECS_CLUSTER_ARN=$(echo "$DEPLOYMENT_SECRETS_JSON" | jq -r '.ECS_CLUSTER_ARN')
+          ECS_SERVICE_NAME=$(echo "$DEPLOYMENT_SECRETS_JSON" | jq -r '.ECS_SERVICE_NAME')
+          ECS_SSL_CERTIFICATE_ARN=$(echo "$DEPLOYMENT_SECRETS_JSON" | jq -r '.ECS_SSL_CERTIFICATE_ARN')
+
+          # Set the extracted values as environment variables
+          echo "ECR_REPOSITORY=$ECR_REPOSITORY" >> $GITHUB_ENV
+          echo "ECS_CLUSTER_ARN=$ECS_CLUSTER_ARN" >> $GITHUB_ENV
+          echo "ECS_SERVICE_NAME=$ECS_SERVICE_NAME" >> $GITHUB_ENV
+          echo "ECS_SSL_CERTIFICATE_ARN=$ECS_SSL_CERTIFICATE_ARN" >> $GITHUB_ENV
+
+          # Add masking for sensitive information
+          echo "::add-mask::$ECR_REPOSITORY"
+          echo "::add-mask::$ECS_CLUSTER_ARN"
+          echo "::add-mask::$ECS_SERVICE_NAME"
+          echo "::add-mask::$ECS_SSL_CERTIFICATE_ARN"
+
+          echo "Github Secrets fetched successfully."
+
+      - name: Fetch App Secrets from AWS Secrets Manager and create .env file
+        run: |
+          APP_SECRETS_JSON=$(aws secretsmanager get-secret-value --secret-id ${{ env.APP_SECRETS }} --query 'SecretString' --output text)
+          echo "$APP_SECRETS_JSON" | jq -r 'to_entries | .[] | "\(.key)=\(.value)"' > .env
+          echo "App Secrets fetched successfully."
 
       - name: Setup Docker Buildx
         uses: docker/setup-buildx-action@v1
@@ -29,14 +66,10 @@ jobs:
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v1
 
-      - name: Add .env file
-        run: |
-          echo ${{ secrets.PRODUCTION_ENV }} | base64 -d > .env
-
       - name: Build, tag, and push Docker image
         run: |
-          docker build -t ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/${{ secrets.ECR_PRODUCTION_REPOSITORY }}:latest -f Dockerfile .
-          docker push ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/${{ secrets.ECR_PRODUCTION_REPOSITORY }}:latest
+          docker build -t ${{ env.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPOSITORY }}:latest -f Dockerfile .
+          docker push ${{ env.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPOSITORY }}:latest
 
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v1
@@ -46,16 +79,16 @@ jobs:
       - name: Terraform deploy
         id: deploy
         run: |
-          cd terraform/production
+          cd terraform/${{ env.ENVIRONMENT }}
           terraform init
-          terraform workspace select Production || terraform workspace new Production
+          terraform workspace select ${{ env.ENVIRONMENT }} || terraform workspace new ${{ env.ENVIRONMENT }}
           terraform apply -auto-approve \
-            -var="region=${{ secrets.AWS_REGION }}" \
-            -var="certificate_arn=${{ secrets.ECS_SSL_CERTIFICATE_ARN }}"
+            -var="region=${{ env.AWS_REGION }}" \
+            -var="certificate_arn=${{ env.ECS_SSL_CERTIFICATE_ARN }}"
 
       - name: Force new ECS deployment
         run: |
-          CLUSTER_ARN=${{ secrets.ECS_CLUSTER_PRODUCTION_ARN }}
-          SERVICE_NAME=${{ secrets.ECS_SERVICE_PRODUCTION_NAME }}
+          CLUSTER_ARN=${{ env.ECS_CLUSTER_ARN }}
+          SERVICE_NAME=${{ env.ECS_SERVICE_NAME }}
           aws ecs update-service --cluster "$CLUSTER_ARN" --service "$SERVICE_NAME" --force-new-deployment
           aws ecs wait services-stable --cluster "$CLUSTER_ARN" --services "$SERVICE_NAME"
