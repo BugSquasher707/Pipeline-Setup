@@ -5,11 +5,15 @@ on:
     branches: ['main']
 
 env:
+  APP_NAME: APP_NAME
   ENVIRONMENT: production
+  APP_SECRETS: ${{ secrets.APP_SECRETS_PRODUCTION }}
   AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
   AWS_REGION: ${{ secrets.AWS_REGION }}
   DEPLOYMENT_SECRETS: ${{ secrets.DEPLOYMENT_SECRETS_PRODUCTION }}
-  APP_SECRETS: ${{ secrets.APP_SECRETS_PRODUCTION }}
+  ECS_CLUSTER_ARN: "arn:aws:ecs:$AWS_REGION:$AWS_ACCOUNT_ID:cluster/$APP_NAME-$ENVIRONMENT-cluster"
+  ECR_REPOSITORY: "$APP_NAME-$ENVIRONMENT"
+  ECS_SERVICE_NAME: "$APP_NAME-$ENVIRONMENT-service"
 
 jobs:
   build_and_deploy:
@@ -34,21 +38,12 @@ jobs:
           DEPLOYMENT_SECRETS_JSON=$(aws secretsmanager get-secret-value --secret-id ${{ env.DEPLOYMENT_SECRETS }} --query 'SecretString' --output text)  
 
           # Extract the required values from the JSON 
-          ECR_REPOSITORY=$(echo "$DEPLOYMENT_SECRETS_JSON" | jq -r '.ECR_REPOSITORY')
-          ECS_CLUSTER_ARN=$(echo "$DEPLOYMENT_SECRETS_JSON" | jq -r '.ECS_CLUSTER_ARN')
-          ECS_SERVICE_NAME=$(echo "$DEPLOYMENT_SECRETS_JSON" | jq -r '.ECS_SERVICE_NAME')
           ECS_SSL_CERTIFICATE_ARN=$(echo "$DEPLOYMENT_SECRETS_JSON" | jq -r '.ECS_SSL_CERTIFICATE_ARN')
 
           # Set the extracted values as environment variables
-          echo "ECR_REPOSITORY=$ECR_REPOSITORY" >> $GITHUB_ENV
-          echo "ECS_CLUSTER_ARN=$ECS_CLUSTER_ARN" >> $GITHUB_ENV
-          echo "ECS_SERVICE_NAME=$ECS_SERVICE_NAME" >> $GITHUB_ENV
           echo "ECS_SSL_CERTIFICATE_ARN=$ECS_SSL_CERTIFICATE_ARN" >> $GITHUB_ENV
 
           # Add masking for sensitive information
-          echo "::add-mask::$ECR_REPOSITORY"
-          echo "::add-mask::$ECS_CLUSTER_ARN"
-          echo "::add-mask::$ECS_SERVICE_NAME"
           echo "::add-mask::$ECS_SSL_CERTIFICATE_ARN"
 
           echo "Github Secrets fetched successfully."
@@ -83,6 +78,8 @@ jobs:
           terraform init
           terraform workspace select ${{ env.ENVIRONMENT }} || terraform workspace new ${{ env.ENVIRONMENT }}
           terraform apply -auto-approve \
+            -var="app_name=${{ env.APP_NAME }}" \
+            -var="environment=${{ env.ENVIRONMENT }}" \
             -var="region=${{ env.AWS_REGION }}" \
             -var="certificate_arn=${{ env.ECS_SSL_CERTIFICATE_ARN }}"
 
